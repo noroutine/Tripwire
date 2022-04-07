@@ -39,6 +39,12 @@ class Tripwire:
             if hasattr(mod, 'tcp_trigger'):
                 getattr(mod, 'tcp_trigger')(eth, iph, tcph)
 
+    @ratelimit.limits(calls=ratelimitCalls, period=ratelimitPeriod)
+    def fireUdpTrigger(self, eth, iph, udph):
+        for mod_name, mod in self.triggers.items():
+            if hasattr(mod, 'udp_trigger'):
+                getattr(mod, 'udp_trigger')(eth, iph, udph)
+
     def fireTrigger(self, eth, iph):
         for mod_name, mod in self.triggers.items():
             if hasattr(mod, 'trigger'):
@@ -47,6 +53,11 @@ class Tripwire:
 class Network:
     IP_PROTOCOL = 8
     TCP_PROTOCOL = 6
+    UDP_PROTOCOL = 17
+    GRE_PROTOCOL = 47
+    AH_PROTOCOL = 51
+    ESP_PROTOCOL = 50
+
     ICMP_PROTOCOL = 1
 
     onlyLocal = False
@@ -141,7 +152,25 @@ class TcpHeader:
         self.sequence = self.unpacked[2]
         self.acknowledgement = self.unpacked[3]
         self.length = self.unpacked[4] >> 4
+        # TODO: This looks wrong, check the math later
         size = EthernetHeader.length + iph.length + self.length * 4
+        self.size = len(packet) - size
+        self.data = packet[size:]
+
+class UdpHeader:
+    """Class to process a packet to UdpHeader"""
+    #Parse the Udp Header
+    #https://datatracker.ietf.org/doc/html/rfc768
+    def __init__(self, iph, packet):
+        rawLength = iph.length + EthernetHeader.length
+        raw = packet[rawLength:rawLength+8]
+        self.unpacked = struct.unpack('!HHHH' , raw)
+        self.src_port = self.unpacked[0]
+        self.dest_port = self.unpacked[1]
+        self.length = self.unpacked[2] >> 4
+        # TODO: This looks wrong, check the math later
+        size = EthernetHeader.length + iph.length + self.length * 4
+        self.checksum = self.unpacked[3]
         self.size = len(packet) - size
         self.data = packet[size:]
 
@@ -250,6 +279,9 @@ def main() -> None:
             if Network.onlyLocal and (not Network.isLocal(iph.dest_addr) or not Network.isLocal(iph.src_addr)):
                 continue
 
+            if Network.isLocal(iph.src_addr):
+                continue
+
             #TCP protocol
             if iph.protocol == Network.TCP_PROTOCOL:
                 #Parse TCP packet
@@ -265,27 +297,57 @@ def main() -> None:
                     continue
 
                 #Packet tries to establish a new TCP connection to the machine -> Trigger
-                if iph.src_addr != Network.localIp and tcph.acknowledgement == 0x00:
-                    logging.info("TCP-Trigger by " + iph.src_addr + " (" + eth.src_mac + ") on Port " + str(tcph.dest_port))
+                if iph.src_addr != Network.localIp:
+                    logging.info(f"trigger=tcp src={iph.src_addr} mac={eth.src_mac} port={str(tcph.dest_port)} ack={tcph.acknowledgement}")
+                    # if tcph.acknowledgement == 0x00:   ?? do I need to bother?
                     tripwire.fireTrigger(eth, iph)
                     try:
                         tripwire.fireTcpTrigger(eth, iph, tcph)
                     except ratelimit.exception.RateLimitException:
                         pass
 
+            elif iph.protocol == Network.UDP_PROTOCOL:
+                #Parse UDP packet
+                udph = UdpHeader(iph, packet)
+
+                if iph.src_addr != Network.localIp:
+                    logging.info(f"trigger=udp src={iph.src_addr} mac={eth.src_mac} port={str(udph.dest_port)}")
+                    tripwire.fireTrigger(eth, iph)
+                    try:
+                        tripwire.fireUdpTrigger(eth, iph, udph)
+                    except ratelimit.exception.RateLimitException:
+                        pass
+
+            elif iph.protocol == Network.GRE_PROTOCOL:
+                if iph.src_addr != Network.localIp:
+                    logging.info(f"trigger=gre src={iph.src_addr} mac={eth.src_mac}")
+                    tripwire.fireTrigger(eth, iph)
+
+            elif iph.protocol == Network.AH_PROTOCOL:
+                if iph.src_addr != Network.localIp:
+                    logging.info(f"trigger=ah src={iph.src_addr} mac={eth.src_mac}")
+                    tripwire.fireTrigger(eth, iph)
+
+            elif iph.protocol == Network.ESP_PROTOCOL:
+                if iph.src_addr != Network.localIp:
+                    logging.info(f"trigger=esp src={iph.src_addr} mac={eth.src_mac}")
+                    tripwire.fireTrigger(eth, iph)
+
             #ICMP Packets
-            elif iph.protocol == Network.ICMP_PROTOCOL: 
+            elif iph.protocol == Network.ICMP_PROTOCOL:
                 #Parse ICMP packet
                 icmph = IcmpHeader(iph, packet)
 
                 #Not the local machine is asking for a Timestamp, Information Request or Echo -> Trigger
                 if iph.src_addr != Network.localIp and (icmph.type == 13 or icmph.type == 15 or icmph.type == 8):
-                    logging.info("ICMP-Trigger by " + iph.src_addr + " (" + eth.src_mac + ") of Type " + str(icmph.type))
+                    logging.info(f"trigger=icmp src={iph.src_addr} mac={eth.src_mac} type={str(icmph.type)}")
                     tripwire.fireTrigger(eth, iph)
                     try:
                         tripwire.fireIcmpTrigger(eth, iph, icmph)
                     except ratelimit.exception.RateLimitException:
                         pass
+            else:
+                logging.info(f"trigger=todo src={iph.src_addr} mac={eth.src_mac} proto={str(iph.protocol)}")
 
 if __name__ == "__main__":
     main()
